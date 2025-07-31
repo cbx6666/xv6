@@ -6,6 +6,10 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
+
+extern uint64 count_free_mem();
+extern uint64 count_used_proc();
 
 uint64
 sys_exit(void)
@@ -94,4 +98,36 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_trace(void)
+{
+  int mask;
+  // 从用户传入的第 0 个参数中读取一个整数，存到 mask
+  if(argint(0, &mask) < 0)
+    return -1;
+  
+  // 把刚刚读取的 mask 保存进这个进程的 trace_mask 字段中
+  myproc()->trace_mask = mask;  // 获取当前正在运行的进程结构体
+  return 0;
+}
+
+uint64 
+sys_sysinfo(void)
+{
+  struct sysinfo info;
+  uint64 addr;
+
+  if(argaddr(0, &addr) < 0)  // 获取用户传入的地址参数
+    return -1;
+
+  info.freemem = count_free_mem();  // 获取空闲内存字节数
+  info.nproc = count_used_proc();   // 获取非UNUSED进程数
+
+  // 将结构体从内核空间拷贝到用户空间
+  if(copyout(myproc()->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+    return -1;
+
+  return 0;
 }

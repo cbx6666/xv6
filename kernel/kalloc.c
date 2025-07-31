@@ -14,10 +14,12 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
+// 空闲页链表                   
 struct run {
   struct run *next;
 };
 
+// 管理内存分配器
 struct {
   struct spinlock lock;
   struct run *freelist;
@@ -30,6 +32,7 @@ kinit()
   freerange(end, (void*)PHYSTOP);
 }
 
+// 将一段内存范围按页加入空闲链表
 void
 freerange(void *pa_start, void *pa_end)
 {
@@ -79,4 +82,17 @@ kalloc(void)
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+// 统计空闲内存
+uint64 
+count_free_mem()
+{
+  struct run *r;
+  uint64 total = 0;
+  acquire(&kmem.lock);  // 上锁，防止数据竞态
+  for(r = kmem.freelist; r; r = r->next)  // 遍历空闲页链表
+    total += PGSIZE;  // 页表大小
+  release(&kmem.lock);
+  return total;
 }

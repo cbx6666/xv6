@@ -20,6 +20,7 @@ static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+extern pagetable_t kernel_pagetable;
 
 // initialize the proc table at boot time.
 void
@@ -28,19 +29,10 @@ procinit(void)
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
-  for(p = proc; p < &proc[NPROC]; p++) {
-      initlock(&p->lock, "proc");
-
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+  for(p = proc; p < &proc[NPROC]; p++){
+    initlock(&p->lock, "proc");
   }
+ 
   kvminithart();
 }
 
@@ -89,9 +81,11 @@ allocpid() {
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
+// 分配和初始化一个新的进程控制块
 static struct proc*
 allocproc(void)
 {
+  // 从进程表中找到空闲的进程槽，初始化进程的内核状态，为进程运行做准备
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
@@ -107,26 +101,46 @@ allocproc(void)
 found:
   p->pid = allocpid();
 
-  // Allocate a trapframe page.
+  // 分配陷阱帧页，保存陷入内核时的寄存器快照
+  // kalloc() 分配一个物理页面，返回直接映射的虚拟地址
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // An empty user page table.
+  // 创建用户页表
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
     freeproc(p);
     release(&p->lock);
     return 0;
   }
+  
+  // 创建内核页表副本
+  p->kernel_pagetable = kvmcreate();
+  if(p->kernel_pagetable == 0){
+    // 释放进程资源
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 分配内核栈
+  char *pa = kalloc();
+    if(pa == 0)
+        panic("kalloc");
+    uint64 va = KSTACK((int) (p - proc));
+    kvmmap_p(p->kernel_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+    p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
+  // 进程的内核上下文，保存 CPU 切换进程时的状态
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  
   return p;
 }
 
@@ -139,9 +153,16 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+
+  if(p->kernel_pagetable){
+    free_kernel_pagetable(p);
+    p->kernel_pagetable = 0;
+  }
+
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -221,6 +242,10 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  // 添加：将用户页表映射复制到内核页表
+  if(kvmmap_user(p->kernel_pagetable, p->pagetable, 0, p->sz)<0)
+    panic("userinit: kvmmap_user failed");
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -238,16 +263,27 @@ userinit(void)
 int
 growproc(int n)
 {
+  // 动态调整进程的内存大小
   uint sz;
   struct proc *p = myproc();
 
   sz = p->sz;
+
+  // 检查 PLIC 限制
+  if(PGROUNDUP(sz + n) >= PLIC)
+    return -1;
+
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) 
       return -1;
-    }
-  } else if(n < 0){
+
+    // 添加新映射到内核页表
+    if(kvmmap_user(p->kernel_pagetable, p->pagetable, p->sz, n) < 0)
+      return -1;
+  }else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 从内核页表移除映射
+    kuvmdealloc(p->kernel_pagetable, p->sz, p->sz + n, 0);
   }
   p->sz = sz;
   return 0;
@@ -274,6 +310,13 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  // 添加：将子进程的用户页表映射复制到其内核页表
+  if(kvmmap_user(np->kernel_pagetable, np->pagetable, 0, np->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   np->parent = p;
 
@@ -473,10 +516,18 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 添加这两行代码：切换到进程的内核页表
+        w_satp(MAKE_SATP(p->kernel_pagetable));  // 加载进程的内核页表
+        sfence_vma();  // 刷新 TLB
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+
+        // 切换回全局内核页表
+        kvminithart();
         c->proc = 0;
 
         found = 1;

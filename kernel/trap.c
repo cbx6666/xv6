@@ -67,6 +67,28 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+    // 计时器中断
+    if(which_dev == 2){
+      // 检查是否设置了警报且未在处理中
+      if(p->alarm_interval > 0 && p->alarm_gooff == 0){
+        p->alarm_ticks--;
+
+         // 时间到了，触发警报
+        if(p->alarm_ticks <= 0){
+          // 重置计数器
+          p->alarm_ticks = p->alarm_interval; 
+
+          // 保存当前状态
+          p->alarm_trapframe = *p->trapframe;
+          
+          // 设置重入保护标记
+          p->alarm_gooff = 1;
+          
+          // 修改返回地址到警报处理函数，跳转到 alarm 函数
+          p->trapframe->epc = (uint64)p->alarm_handler;
+        }
+      }
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

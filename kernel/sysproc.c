@@ -58,6 +58,8 @@ sys_sleep(void)
   int n;
   uint ticks0;
 
+  backtrace(); // 添加调试函数
+
   if(argint(0, &n) < 0)
     return -1;
   acquire(&tickslock);
@@ -94,4 +96,38 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int interval; // 警报间隔
+  uint64 handler; // 警报处理函数指针
+ 
+  // 获取参数
+  if(argint(0, &interval) < 0)
+    return -1;
+  if(argaddr(1, &handler) < 0)
+    return -1;
+
+  struct proc *p = myproc();
+  p->alarm_interval = interval;
+  p->alarm_handler = (void(*)())handler;
+  p->alarm_ticks = interval;
+
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+ 
+  // 恢复保存的寄存器状态
+  *p->trapframe = p->alarm_trapframe;
+  
+  // 清除重入保护标记
+  p->alarm_gooff = 0;
+
+  return 0;
 }

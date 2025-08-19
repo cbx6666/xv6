@@ -339,6 +339,12 @@ sfence_vma()
 
 #define PTE_FLAGS(pte) ((pte) & 0x3FF)
 
+#define PTE_COW (1L << 8)  // 使用 RSW 位标记页面是 COW 页面
+
+// 引用计数相关
+#define PA2REFIDX(pa) (((uint64)pa) >> 12)  // 物理地址转引用计数索引，表示页面号
+#define REFIDX2PA(idx) ((uint64)(idx) << 12)  // 引用计数索引转物理地址
+
 // extract the three 9-bit page table indices from a virtual address.
 #define PXMASK          0x1FF // 9 bits
 #define PXSHIFT(level)  (PGSHIFT+(9*(level)))

@@ -29,6 +29,44 @@ trapinithart(void)
   w_stvec((uint64)kernelvec);
 }
 
+// 处理 COW 页错误
+int
+cowfault(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA)
+    return -1;
+
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_COW) == 0)
+    return -1;
+
+  uint64 pa = PTE2PA(*pte);
+
+  // 如果引用计数为1，直接设置为可写
+  if(kgetref((void*)pa) == 1){
+    *pte = (*pte | PTE_W) & ~PTE_COW;
+    return 0;
+  }
+
+  // 引用计数大于1，需要复制页面
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1; // 内存不足，进程将被杀死
+ 
+  // 复制页面内容
+  memmove(mem, (char*)pa, PGSIZE);
+
+  // 更新PTE指向新页面
+  uint flags = PTE_FLAGS(*pte);
+  flags = (flags | PTE_W) & ~PTE_COW;
+  *pte = PA2PTE(mem) | flags;
+
+  // 减少旧页面的引用计数
+  kfree((void*)pa); 
+
+  return 0;
+}
+
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
@@ -67,6 +105,11 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 13 || r_scause() == 15){
+    // 以页为单位，发生缺页中断时，只改变该页面的映射
+    uint64 va = r_stval();
+    if(cowfault(p->pagetable, va) < 0) 
+      p->killed = 1; // COW 处理失败，杀死进程
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

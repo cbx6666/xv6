@@ -311,7 +311,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,14 +319,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    // 如果原来是可写的，标记为 COW 并移除写权限
+    if(flags & PTE_W){
+      flags = (flags | PTE_COW) & ~PTE_W;
+      *pte = PA2PTE(pa) | flags; // 更新父进程PTE
     }
-  }
+
+    // 子进程也指向同一物理页面，使用相同标志
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+    
+    // 增加物理页面的引用计数
+    krefpage((void*)pa);
+    }
+  
   return 0;
 
  err:
@@ -361,6 +367,16 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
+
+    // 检查是否为 COW 页面
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte && (*pte & PTE_COW)){
+      // 处理 COW 页面
+      if(cowfault(pagetable, va0) < 0)
+        return -1;
+      pa0 = walkaddr(pagetable, va0); // 重新获取物理地址
+    }
+    
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;

@@ -21,12 +21,17 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  // PHYSTOP 是物理内存的最高地址，每个页面 4KB，PHYSTOP >> 12 就是总的物理页面数
+  int refcnt[PHYSTOP >> 12]; // 引用计数数组
 } kmem;
 
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  // 初始化所有页面引用计数为0
+  for(int i = 0; i < (PHYSTOP >> 12); i++)
+    kmem.refcnt[i] = 0;
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -37,6 +42,32 @@ freerange(void *pa_start, void *pa_end)
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
+}
+
+// 增加引用计数
+void
+krefpage(void *pa)
+{
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("krefpage");
+  
+  acquire(&kmem.lock);
+  kmem.refcnt[PA2REFIDX(pa)]++;
+  release(&kmem.lock);
+}
+
+// 获取引用计数
+int
+kgetref(void *pa)
+{
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    return -1;
+  
+  int ref;
+  acquire(&kmem.lock);
+  ref = kmem.refcnt[PA2REFIDX(pa)];
+  release(&kmem.lock);
+  return ref;
 }
 
 // Free the page of physical memory pointed at by v,
@@ -51,14 +82,25 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
-
   acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
+
+  // 减少引用计数
+  int refidx = PA2REFIDX(pa);
+  if(kmem.refcnt[refidx] < 0)
+    panic("kfree: refcnt < 0");
+  
+  if(kmem.refcnt[refidx] > 0)
+    kmem.refcnt[refidx]--;
+
+  // 只有引用计数为0时才真正释放
+  if(kmem.refcnt[refidx] == 0){
+    // Fill with junk to catch dangling refs.
+    memset(pa, 1, PGSIZE);
+
+    r = (struct run*)pa;
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
   release(&kmem.lock);
 }
 
@@ -72,8 +114,10 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
+    kmem.refcnt[PA2REFIDX(r)] = 1;  // 设置引用计数为1
+  }
   release(&kmem.lock);
 
   if(r)

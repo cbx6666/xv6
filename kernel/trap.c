@@ -65,6 +65,27 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if (r_scause() == 13 || r_scause() == 15){
+    // 13 is read page fault, 15 is write page fault
+    // RISC-V 架构中的一个特殊寄存器，用于存储导致页错误或其他异常的虚拟地址。
+    uint64 va = r_stval();
+
+    if(va >= p->sz  || va <= PGROUNDDOWN(p->trapframe->sp)){
+      // 超出堆区范围或栈溢出
+      p->killed = 1;
+    } else {
+      va = PGROUNDDOWN(va);
+      char *mem = kalloc(); // 分配物理页
+      if(mem == 0){
+        p->killed = 1;
+      } else {
+        memset(mem, 0, PGSIZE);
+        if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U) != 0){
+          kfree(mem);
+          p->killed = 1;
+        }
+      }
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

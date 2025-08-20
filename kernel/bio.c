@@ -23,15 +23,24 @@
 #include "fs.h"
 #include "buf.h"
 
+#define NBUCKET 13
+
+struct {
+  struct spinlock lock;
+  struct buf head;
+} bucket[NBUCKET];
+
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
-
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
 } bcache;
+
+// 哈希函数：将 (dev, blockno) 映射到桶
+int
+hash(uint dev, uint blockno)
+{
+  return (dev + blockno) % NBUCKET;
+}
 
 void
 binit(void)
@@ -40,15 +49,27 @@ binit(void)
 
   initlock(&bcache.lock, "bcache");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
+  // 初始化每个桶的锁和链表
+  for(int i = 0; i < NBUCKET; i++){
+    char name[16];
+    snprintf(name, sizeof(name), "bcache.bucket_%d", i);
+    initlock(&bucket[i].lock, name);
+    
+    // 初始化桶的循环链表
+    bucket[i].head.prev = &bucket[i].head;
+    bucket[i].head.next = &bucket[i].head;
+  }
+
+  // 将所有缓存块分散到各个桶中
+  for(b = bcache.buf; b < bcache.buf + NBUF; b++){
+    int bucket_id = (b - bcache.buf) % NBUCKET;
+
+    b->next = bucket[bucket_id].head.next;
+    b->prev = &bucket[bucket_id].head;
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->timestamp = ticks;
+    bucket[bucket_id].head.next->prev = b;
+    bucket[bucket_id].head.next = b;
   }
 }
 
@@ -59,32 +80,97 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
+  int bucket_id = hash(dev, blockno);
 
-  acquire(&bcache.lock);
+  acquire(&bucket[bucket_id].lock);
 
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+  // 在对应桶中查找是否已缓存
+  for(b = bucket[bucket_id].head.next; b != &bucket[bucket_id].head; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
       b->refcnt++;
-      release(&bcache.lock);
+      release(&bucket[bucket_id].lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
+  // 缓存未命中，需要分配新的缓存块
+  release(&bucket[bucket_id].lock);
+
+  acquire(&bcache.lock);
+  acquire(&bucket[bucket_id].lock);
+
+  // 双重检查：可能在等待锁期间其他进程已经缓存了该块
+  for(b = bucket[bucket_id].head.next; b != &bucket[bucket_id].head; b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      b->refcnt++;
+      release(&bucket[bucket_id].lock);
       release(&bcache.lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
+  
+  // 查找可重用的缓存块（LRU策略）
+  struct buf *least_recent = 0;
+  uint least_recent_ticks = 0xFFFFFFFF;
+
+  // 先在当前桶中查找
+  for(b = bucket[bucket_id].head.next; b != &bucket[bucket_id].head; b = b->next){
+    if(b->refcnt == 0 && b->timestamp < least_recent_ticks){
+      least_recent = b;
+      least_recent_ticks = b->timestamp;
+    }
+  }
+
+  // 如果当前桶没有可用的，查找其他桶
+  if(!least_recent){
+    for(int i = 0; i < NBUCKET; i++){
+      if(i == bucket_id) 
+        continue;
+      
+      acquire(&bucket[i].lock);
+      for(b = bucket[i].head.next; b != &bucket[i].head; b = b->next){
+        if(b->refcnt == 0 && b->timestamp < least_recent_ticks){
+          least_recent = b;
+          least_recent_ticks = b->timestamp;
+        }
+      }
+      release(&bucket[i].lock);
+    }
+  }
+
+  if(!least_recent) {
+    panic("bget: no buffers");
+  }
+
+  // 如果选中的缓存块在其他桶中，需要移动它
+  if(least_recent){
+    int old_bucket = hash(least_recent->dev, least_recent->blockno);
+    if(old_bucket != bucket_id){
+      acquire(&bucket[old_bucket].lock);
+      // 从旧桶中移除
+      least_recent->next->prev = least_recent->prev;
+      least_recent->prev->next = least_recent->next;
+      release(&bucket[old_bucket].lock);
+      
+      // 添加到新桶
+      least_recent->next = bucket[bucket_id].head.next;
+      least_recent->prev = &bucket[bucket_id].head;
+      bucket[bucket_id].head.next->prev = least_recent;
+      bucket[bucket_id].head.next = least_recent;
+    }
+    least_recent->dev = dev;
+    least_recent->blockno = blockno;
+    least_recent->valid = 0;
+    least_recent->refcnt = 1;
+
+    release(&bucket[bucket_id].lock);
+    release(&bcache.lock);
+    acquiresleep(&least_recent->lock);
+    return least_recent;
+  }
+
   panic("bget: no buffers");
 }
 
@@ -121,19 +207,14 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  int bucket_id = hash(b->dev, b->blockno);
+
+  acquire(&bucket[bucket_id].lock);
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+  if(b->refcnt == 0){
+    b->timestamp = ticks;
   }
-  
-  release(&bcache.lock);
+  release(&bucket[bucket_id].lock);
 }
 
 void

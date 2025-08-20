@@ -10,11 +10,30 @@
 #define STACK_SIZE  8192
 #define MAX_THREAD  4
 
+// 定义上下文结构，保存 callee-save 寄存器
+struct context {
+  uint64 ra;
+  uint64 sp;
+
+  // callee-save 寄存器
+  uint64 s0;
+  uint64 s1;
+  uint64 s2;
+  uint64 s3;
+  uint64 s4;
+  uint64 s5;
+  uint64 s6;
+  uint64 s7;
+  uint64 s8;
+  uint64 s9;
+  uint64 s10;
+  uint64 s11;
+};
 
 struct thread {
   char       stack[STACK_SIZE]; /* the thread's stack */
   int        state;             /* FREE, RUNNING, RUNNABLE */
-
+  struct     context context;   /* 保存的寄存器状态 */
 };
 struct thread all_thread[MAX_THREAD];
 struct thread *current_thread;
@@ -40,29 +59,33 @@ thread_schedule(void)
   /* Find another runnable thread. */
   next_thread = 0;
   t = current_thread + 1;
+  // 找到下一个可以运行的线程
   for(int i = 0; i < MAX_THREAD; i++){
+    // 超出数组长度就重新从数组首地址开始
     if(t >= all_thread + MAX_THREAD)
       t = all_thread;
-    if(t->state == RUNNABLE) {
+    if(t->state == RUNNABLE){
       next_thread = t;
       break;
     }
     t = t + 1;
   }
 
-  if (next_thread == 0) {
+  if(next_thread == 0){
     printf("thread_schedule: no runnable threads\n");
     exit(-1);
   }
 
-  if (current_thread != next_thread) {         /* switch threads?  */
+  if(current_thread != next_thread){         /* switch threads?  */
     next_thread->state = RUNNING;
     t = current_thread;
     current_thread = next_thread;
     /* YOUR CODE HERE
-     * Invoke thread_switch to switch from t to next_thread:
-     * thread_switch(??, ??);
+     * 调用 thread_switch 进行实际的线程切换
+     * 第一个参数是当前线程的 context 地址
+     * 第二个参数是要切换到的线程的 context 地址
      */
+    thread_switch((uint64)&t->context, (uint64)&current_thread->context);
   } else
     next_thread = 0;
 }
@@ -75,8 +98,36 @@ thread_create(void (*func)())
   for (t = all_thread; t < all_thread + MAX_THREAD; t++) {
     if (t->state == FREE) break;
   }
+
+  // 检查是否找到空闲槽位
+  if(t >= all_thread + MAX_THREAD){
+    printf("thread_create: no free thread slots\n");
+    return;  
+  }
+
   t->state = RUNNABLE;
   // YOUR CODE HERE
+  memset((void *)&t->stack, 0, STACK_SIZE);
+  memset((void *)&t->context, 0, sizeof(struct context));
+  // 设置栈指针到栈顶
+  t->context.sp = (uint64)t->stack + STACK_SIZE;
+  // 设置返回地址为要执行的函数
+  // 当 thread_switch 返回时，会跳转到这个函数执行
+  t->context.ra = (uint64)func;
+
+  // 其他寄存器可以初始化为 0
+  t->context.s0 = 0;
+  t->context.s1 = 0;
+  t->context.s2 = 0;
+  t->context.s3 = 0;
+  t->context.s4 = 0;
+  t->context.s5 = 0;
+  t->context.s6 = 0;
+  t->context.s7 = 0;
+  t->context.s8 = 0;
+  t->context.s9 = 0;
+  t->context.s10 = 0;
+  t->context.s11 = 0;
 }
 
 void 

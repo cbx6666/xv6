@@ -26,11 +26,30 @@ static void
 barrier()
 {
   // YOUR CODE HERE
-  //
-  // Block until all threads have called barrier() and
-  // then increment bstate.round.
-  //
+  // 获取互斥锁，保护共享状态
+  pthread_mutex_lock(&bstate.barrier_mutex);
   
+  // 增加到达屏障的线程计数
+  bstate.nthread++;
+  
+  // 所有线程到达
+  if (bstate.nthread == nthread) {
+    // 进入下一轮
+    bstate.round++;
+    bstate.nthread = 0;
+    // 唤醒所有线程
+    pthread_cond_broadcast(&bstate.barrier_cond);
+  } else {
+    // 记录当前轮数
+    int current_round = bstate.round;
+
+    // 只要还在同一轮，就继续等待
+    while (bstate.round == current_round){
+        pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+    }
+  }
+  // 释放互斥锁
+  pthread_mutex_unlock(&bstate.barrier_mutex);
 }
 
 static void *

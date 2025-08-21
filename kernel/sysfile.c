@@ -335,7 +335,7 @@ sys_open(void)
 
     ilock(ip);
     depth++;
-    if (depth > 10) {
+    if(depth > 10){
       //默认死循环
       iunlockput(ip);
       end_op();

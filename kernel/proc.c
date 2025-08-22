@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -284,6 +285,14 @@ fork(void)
 
   np->parent = p;
 
+  for(int i = 0; i < 16; i++){
+    if(p->vmas[i].valid && p->vmas[i].file){
+      np->vmas[i] = p->vmas[i];
+      // 增加文件的引用计数
+      filedup(np->vmas[i].file); 
+    }
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -343,6 +352,22 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+   for(int i = 0; i < 16; i++){
+    if(p->vmas[i].valid){
+      // 写回文件
+      if(p->vmas[i].flags & (MAP_SHARED)){
+        filewrite(p->vmas[i].file, p->vmas[i].addr, p->vmas[i].length);
+      }
+
+      // 取消映射
+      uvmunmap(p->pagetable, p->vmas[i].addr, PGROUNDDOWN(p->vmas[i].length) / PGSIZE, 1);
+
+      // 减少文件的引用计数
+      if(p->vmas[i].file)
+        fileclose(p->vmas[i].file);
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

@@ -484,3 +484,97 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64 
+sys_mmap(void)
+{
+  uint64 addr;
+  int length, prot, flags, fd, offset;
+
+  // 获取参数
+  if(argaddr(0, &addr) || argint(1, &length) < 0 || argint(2, &prot) < 0 || argint(3, &flags) < 0 || argint(4, &fd) < 0 || argint(5, &offset) < 0)
+    return -1;
+
+  struct proc * p = myproc();
+  struct file* f;
+
+  // 获取文件
+  if(fd < 0 || fd >= NOFILE || (f = p->ofile[fd]) == 0)
+    return -1;
+  
+  // 权限检查
+  if(!f->readable){
+    if((prot & PROT_READ)) return -1;
+  }
+  if(!f->writable){
+    if((prot & PROT_WRITE) && (flags & MAP_SHARED)) return -1;
+  }
+  
+  // 增加文件的引用计数
+  filedup(f); 
+  
+  // 分配一块区域，然后放入对应的 VMA
+  addr = p->sz; 
+  if(p->sz + PGROUNDDOWN(length) >= MAXVA) 
+    return -1;
+  p->sz += PGROUNDUP(length);
+
+  int found = 0;
+  // 找到未使用的VMA
+  for(int i = 0; i < 16; i++){
+    if(p->vmas[i].valid == 0){
+      p->vmas[i].addr = addr;
+      p->vmas[i].length = length;
+      p->vmas[i].prot = prot;
+      p->vmas[i].flags = flags;
+      p->vmas[i].fd = fd;
+      p->vmas[i].file = f;
+      p->vmas[i].valid = 1;
+      found = 1;
+      break;
+    }
+  }
+
+  if(!found) 
+    return -1;
+
+  return addr;
+}
+
+uint64 
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+
+  if(argaddr(0, &addr) || argint(1, &length) < 0)
+    return -1;
+
+  struct proc * p = myproc();
+  int found = 0;
+  for(int i = 0; i < 16; i++){
+    // 找到与虚拟地址对应的 VMA
+    if(addr >= p->vmas[i].addr && addr < p->vmas[i].addr + p->vmas[i].length){
+      found = 1;
+
+      // 写回文件
+      if(p->vmas[i].flags & MAP_SHARED){
+        filewrite(p->vmas[i].file, p->vmas[i].addr, p->vmas[i].length);
+      }
+      // 取消映射
+      uvmunmap(p->pagetable, addr, PGROUNDDOWN(length) / PGSIZE, 1);
+      
+      // 如果映射整个 VMA 的空间，取消映射时则要减少文件的引用计数
+      if(addr == p->vmas[i].addr && length == p->vmas[i].length){
+        fileclose(p->vmas[i].file);
+        p->vmas[i].valid = 0;
+      }
+
+      break;
+    }
+  }
+
+  if(!found) 
+    return -1;
+  return 0;
+}

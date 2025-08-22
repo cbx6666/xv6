@@ -3,8 +3,12 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
 #include "proc.h"
 #include "defs.h"
+#include "file.h"        
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -65,6 +69,48 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 13 || r_scause() == 15){
+    uint64 va = r_stval(); 
+    struct proc* p = myproc();
+    struct vma vma_cur;
+    int found = 0;
+
+    // 根据发生中断的虚拟地址找到对应的 VMA
+    for(int i = 0; i < 16; i++){
+      if(va >= p->vmas[i].addr && va < p->vmas[i].addr + p->vmas[i].length){
+        vma_cur = p->vmas[i];
+        found = 1;
+        break;
+      }
+    }
+    if(found){
+      // 分配对应的物理内存
+      char * pa = kalloc(); 
+      if(pa == 0){ 
+        p->killed = 1; 
+      }
+      memset(pa, 0, PGSIZE); 
+
+      ilock(vma_cur.file->ip);
+      // 把数据读到物理内存中
+      readi(vma_cur.file->ip, 0, (uint64)pa, va - vma_cur.addr, PGSIZE); 
+      iunlock(vma_cur.file->ip);
+
+      // 物理页映射的时候要注意flag
+      uint64 flag = PTE_U;
+      if(vma_cur.prot & (PROT_READ)) 
+        flag |= PTE_R;
+      if(vma_cur.prot & (PROT_WRITE)) 
+        flag |= PTE_W;
+     
+      // 映射到页表
+      if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)pa, flag) != 0){ 
+        kfree(pa); 
+        p->killed = 1;
+      }
+    } else {
+      p->killed = 1;
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
